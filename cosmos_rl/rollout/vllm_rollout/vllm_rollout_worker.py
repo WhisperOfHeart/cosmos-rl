@@ -222,6 +222,7 @@ class vLLMRolloutWorker(RolloutWorkerBase):
 
         # Holding temp tensors created in `recv_tensor_creator`. Do not remove this, or
         self.total_temp_tensor_pool = []
+        self.taotl_tmp_tensor_size = 0
         self.misc_params = set()
         self.validation_flag = threading.Event()
         self.reward_dispatcher = RewardDispatcher()
@@ -492,21 +493,30 @@ class vLLMRolloutWorker(RolloutWorkerBase):
         all_tensor_views_to_copy = []
         tensors_to_check = []
 
+        def get_tensor_mb_size(tensor: torch.Tensor):
+            return tensor.numel() * tensor.element_size() / (1024 * 1024)
+
         def recv_tensor_creator(vllm_tensor_view: torch.Tensor):
             recv_tensor = None
             inplace = True
-
+            allocated_size = 0
             if vllm_tensor_view.is_contiguous():
                 recv_tensor = vllm_tensor_view
             else:
                 # new a temp tensor
                 recv_tensor = torch.empty_like(vllm_tensor_view).contiguous()
+                allocated_size = get_tensor_mb_size(recv_tensor)
                 inplace = False
 
             if vllm_tensor_view.dtype != target_dtype:
                 recv_tensor = recv_tensor.to(target_dtype)
+                allocated_size = get_tensor_mb_size(recv_tensor)
                 inplace = False
             # Hold these recv_tensor, in case of buffer reusing by torch
+            self.total_temp_tensor_size += allocated_size
+            logger.info(
+                f"[Rollout] Total newly allocated temp tensor size: {self.total_temp_tensor_size} MB"
+            )
             self.total_temp_tensor_pool.append(recv_tensor)
 
             return recv_tensor, inplace
@@ -1010,6 +1020,10 @@ class vLLMRolloutWorker(RolloutWorkerBase):
             copy_finished.wait()
 
             torch.cuda.synchronize()
+            logger.info(
+                f"[Rollout] Total newlt allocated temp tensor size: {self.total_temp_tensor_size} MB"
+            )
+            self.total_temp_tensor_size = 0
             self.total_temp_tensor_pool.clear()
 
             time_eclapsed = time.time() - st
