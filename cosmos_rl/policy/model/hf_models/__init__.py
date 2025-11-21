@@ -41,6 +41,7 @@ from cosmos_rl.policy.config import Config as CosmosConfig
 from cosmos_rl.policy.model.hf_models.patch import (
     pre_hf_models_patch,
     post_hf_models_patch,
+    sequence_packing_forward_patch,
 )
 
 
@@ -92,6 +93,7 @@ class HFModel(BaseModel):
         self.is_vlm = is_vlm
         self.need_dequantization = need_dequantization
         self.tp_slice_dim_map = None
+        self.sequence_packing_forward_patched = None
         if getattr(model, "_checkpoint_conversion_mapping", None):
             if hf_config.model_type in ["R"]:
                 logger.warning(
@@ -106,6 +108,20 @@ class HFModel(BaseModel):
                 logger.info(
                     f"reverse_hf_conversion_mapping={self.weight_mapper.reverse_hf_conversion_mapping}"
                 )
+
+    def set_gradient_checkpointing_enabled(self, enabled: bool):
+        """
+        Set the gradient checkpointing enabled flag.
+        This is used to enable or disable the gradient checkpointing for the model.
+        """
+        super().set_gradient_checkpointing_enabled(enabled)
+        # Configure gradient checkpointing if enabled
+        if self._gradient_checkpointing_enabled:
+            self.model.gradient_checkpointing_enable()
+            assert (
+                self.model.is_gradient_checkpointing
+            ), "Gradient checkpointing is not enabled"
+            logger.info("Enabled gradient checkpointing for HFModel")
 
     @cached_property
     def model_forward_valid_kwargs(self):
@@ -125,6 +141,9 @@ class HFModel(BaseModel):
         kwargs_filtered = {
             k: v for k, v in kwargs.items() if k in self.model_forward_valid_kwargs
         }
+
+        if "valid_input_len" in kwargs:
+            kwargs_filtered["valid_input_len"] = kwargs["valid_input_len"]
 
         out = self.model(
             input_ids=input_ids,
@@ -604,14 +623,6 @@ class HFModel(BaseModel):
             )
             kwargs["quantization_config"] = mxfp4_quantization_config
 
-        # Configure gradient checkpointing if enabled
-        if self._gradient_checkpointing_enabled:
-            self.model.gradient_checkpointing_enable()
-            assert (
-                self.model.is_gradient_checkpointing
-            ), "Gradient checkpointing is not enabled"
-            logger.info("Enabled gradient checkpointing for HFModel")
-
         # Use from_pretrained loading in two scenarios:
         # 1. Model requires dequantization (e.g., gpt-oss)
         # 2. Named buffer reinitialization failed
@@ -851,14 +862,14 @@ class HFModel(BaseModel):
         return self.model.named_parameters(*args, **kwargs)
 
     @classmethod
-    def fqn_filter_for_fp8(cls) -> List[str]:
+    def fqn_filter_for_quantization(cls) -> List[str]:
         llm = [
             "lm_head",
         ]
         visual = [
             "visual",
             "vision_tower",
-        ]  # Filter Linear in visual out, they will corrupt the FP8 Linear.
+        ]  # Filter Linear in visual out, they will corrupt the FP8/FP4 Linear.
         return llm + visual
 
     def check_cp_compatible(self, cp_size: int, tp_size: int):
@@ -873,6 +884,13 @@ class HFModel(BaseModel):
         assert (
             num_key_value_heads % tp_size == 0
         ), f"{num_key_value_heads=} must be divisible by TP size ({tp_size})"
+
+    def check_sequence_packing_compatible(self):
+        if self.sequence_packing_forward_patched is None:
+            # called only once if patch is successful
+            patch_success = sequence_packing_forward_patch(self.hf_config, self)
+            self.sequence_packing_forward_patched = patch_success
+        return self.sequence_packing_forward_patched
 
     def post_transform_of_local_view(self, local_view: torch.Tensor, name: str):
         if "gpt_oss" in self.hf_config.model_type:
