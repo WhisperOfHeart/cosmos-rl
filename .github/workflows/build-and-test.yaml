@@ -12,7 +12,7 @@ on:
 
 jobs:
   build_and_test:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Compute Vars
         id: vars
