@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "**" ]
 
+permissions:
+  contents: write  # Needed for peaceiris/actions-gh-pages to deploy
+
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
