@@ -21,6 +21,7 @@ from cosmos_rl.policy.model.hf_models import HFModel
 from cosmos_rl.policy.model.deepseek_v3 import DeepseekV3MoEModel
 from cosmos_rl.policy.model.internvl import InternVLChatModel
 from cosmos_rl.policy.model.vla import OpenVLA
+from cosmos_rl.policy.model.diffusers import DiffuserModel
 from cosmos_rl.policy.model.base import ModelRegistry, BaseModel, WeightMapper
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     "DeepseekV3MoEModel",
     "InternVLChatModel",
     "OpenVLA",
+    "DiffuserModel",
     "BaseModel",
     "WeightMapper",
     "ModelRegistry",
