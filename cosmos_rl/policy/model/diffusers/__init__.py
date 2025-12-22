@@ -22,6 +22,7 @@ from diffusers import (
     DPMSolverMultistepScheduler,
     AutoencoderKLWan,
     SanaVideoTransformer3DModel,
+    StableDiffusion3Pipeline,
 )
 from diffusers.image_processor import PixArtImageProcessor
 from diffusers.video_processor import VideoProcessor
@@ -33,6 +34,7 @@ from cosmos_rl.policy.model.base import BaseModel, ModelRegistry
 from cosmos_rl.policy.model.diffusers.weight_mapper import DiffuserModelWeightMapper
 from cosmos_rl.policy.model.diffusers.constants import get_ratio_bin
 from cosmos_rl.utils.parallelism import ParallelDims
+from cosmos_rl.utils.util import str2torch_dtype
 from cosmos_rl.policy.config import DiffusersConfig
 
 
@@ -52,7 +54,10 @@ class DiffuserModel(BaseModel):
     def __init__(self, config: DiffusersConfig, model_str: str = ""):
         super().__init__()
         complex_human_instruction = config.complex_human_instruction
+        self.config = config
         self.is_video = config.is_video
+        self.use_lora = config.lora is not None
+        self.dtype = str2torch_dtype(config.dtype)
         self.load_models_from_hf(model_str)
 
         self.chi_prompt = "\n".join(complex_human_instruction)
@@ -135,29 +140,49 @@ class DiffuserModel(BaseModel):
         """
         Get init cls for all pipeline parts
         """
-        # TODO: read out cls from pipeline config or load models by config
-        if self.is_video:
-            transformer_cls = SanaVideoTransformer3DModel
-            scheduler_cls = DPMSolverMultistepScheduler
-            vae_cls = AutoencoderKLWan
+        # TODO: read out cls from pipeline config or load models by config, use AutoPipeline here
+        if self.config.usepipeline:
+            return StableDiffusion3Pipeline
         else:
-            transformer_cls = SanaTransformer2DModel
-            scheduler_cls = DPMSolverMultistepScheduler
-            vae_cls = AutoencoderDC
+            if self.is_video:
+                transformer_cls = SanaVideoTransformer3DModel
+                scheduler_cls = DPMSolverMultistepScheduler
+                vae_cls = AutoencoderKLWan
+            else:
+                transformer_cls = SanaTransformer2DModel
+                scheduler_cls = DPMSolverMultistepScheduler
+                vae_cls = AutoencoderDC
+            return transformer_cls, scheduler_cls, vae_cls
 
-        return transformer_cls, scheduler_cls, vae_cls
+    def _load_models_from_pipeline_hf(self, model_str, device="cuda"):
+        pipeline_cls = self.cls_mapping()
+        pipeline = pipeline_cls.from_pretrained(model_str)
+        pipeline.safety_checker = None
+        self.pipeline = pipeline
 
-    def load_models_from_hf(self, model_str, device="cuda"):
-        """
-        Load all models
-        """
+        # TODO(dinghaoy): fine-grained precision control for diffusers pipeline parts
+        self.transformer = pipeline.transformer.to(device)
+        self.vae_model = pipeline.vae.to(device, dtype=self.dtype).eval()
+        self.text_encoders = [
+            pipeline.text_encoder.to(device, dtype=self.dtype).eval(),
+            pipeline.text_encoder_2.to(device, dtype=self.dtype).eval(),
+            pipeline.text_encoder_3.to(device, dtype=self.dtype).eval(),
+        ]
+        self.tokenizers = [
+            pipeline.tokenizer,
+            pipeline.tokenizer_2,
+            pipeline.tokenizer_3,
+        ]
+
+    def _load_models_from_separated_hf(self, model_str, device="cuda"):
         # TODO (yy): get all cls from diffusers config
         # TODO (yy): maybe selective init, preprocessed embedding only need transformers
         transformer_cls, scheduler_cls, vae_cls = self.cls_mapping()
+        self.pipeline = None
         self.transformer = transformer_cls.from_pretrained(
             model_str,
             subfolder="transformer",
-            torch_dtype=torch.bfloat16,
+            torch_dtype=self.dtype,
         ).to(device)
 
         # scheduler must init on cpu
@@ -170,22 +195,57 @@ class DiffuserModel(BaseModel):
         self.vae_model = vae_cls.from_pretrained(
             model_str,
             subfolder="vae",
-            torch_dtype=torch.bfloat16,
+            torch_dtype=self.dtype,
         ).to(device)
         self.vae_model.eval()
 
-        self.text_encoder = (
+        text_encoder = (
             AutoModelForCausalLM.from_pretrained(
-                model_str, subfolder="text_encoder", torch_dtype=torch.bfloat16
+                model_str, subfolder="text_encoder", torch_dtype=self.dtype
             )
             .get_decoder()
             .to(device)
         )
 
-        self.text_encoder.eval()
+        text_encoder.eval()
+        self.text_encoders = [text_encoder]
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_str, subfolder="tokenizer")
-        self.tokenizer.padding_side = "right"
+        tokenizer = AutoTokenizer.from_pretrained(model_str, subfolder="tokenizer")
+        tokenizer.padding_side = "right"
+        self.tokenizers = [tokenizer]
+
+    def load_models_from_hf(self, model_str, device="cuda"):
+        """
+        Load all models
+        """
+        # Load models
+        if self.config.use_pipeline:
+            self._load_models_from_pipeline_hf(self, model_str, device)
+        else:
+            self._load_models_from_separated_hf(self, model_str, device)
+
+        # Add LoRA if needed
+        if self.use_lora:
+            from peft import LoraConfig, get_peft_model, PeftModel
+
+            self.transformer.require_gradients_(False)
+            transformer_lora_config = LoraConfig(
+                r=self.config.lora.r,
+                lora_alpha=self.config.lora.lora_alpha,
+                init_lora_weights=self.config.lora.init_lora_weights,
+                target_modules=self.config.lora.target_modules,
+            )
+            if self.config.lora.lora_path:
+                self.transformer = PeftModel.from_pretrained(
+                    self.transformer, self.config.lora.lora_path
+                )
+                self.transformer.set_adapter("default")
+            else:
+                self.transformer = get_peft_model(
+                    self.transformer, transformer_lora_config
+                )
+            self.transformer.add_adapter("ref", transformer_lora_config)
+            self.transformer.set_adapter("default")
 
     @classmethod
     def from_pretrained(cls, config, diffusers_config_args):

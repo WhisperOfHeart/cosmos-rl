@@ -609,6 +609,17 @@ class TrainingConfig(BaseModel):
         default=1.0, description="Gradient norm clip for optimizer"
     )
 
+    # --------- EMA ---------
+    ema_enable: bool = Field(
+        default=False,
+        description="Whether to enable EMA for model parameters. Only support diffusers models for now.",
+    )
+    ema_decay: float = Field(default=0.9999, description="Decay rate for EMA")
+    ema_update_step_interval: int = Field(
+        default=0,
+        description="Interval steps to update EMA parameters, 0 means update every step",
+    )
+
     # --------- FSDP ---------
 
     master_dtype: str = Field(
@@ -786,6 +797,9 @@ class RolloutParallelismConfig(ParallelismConfig):
 
 class LoraConfig(BaseModel):
     r: int = Field(default=8, description="LoRA rank")
+    lora_path: Optional[str] = Field(
+        default=None, description="Path to pre-trained LoRA weights"
+    )
     lora_alpha: float = Field(default=8.0, description="LoRA alpha")
     lora_dropout: float = Field(default=0.0, description="LoRA dropout")
     target_modules: Union[List[str], str] = Field(
@@ -834,6 +848,14 @@ class LoraConfig(BaseModel):
 
 
 class DiffusersConfig(BaseModel):
+    dtype: str = Field(
+        default="float16",
+        description="Data type for diffusers model",
+        choices=["float16", "bfloat16", "float32"],
+    )
+    use_pipeline: bool = Field(
+        default=False, description="Whether to use diffusers pipeline"
+    )
     complex_human_instruction: List[str] = Field(
         default=[""], description="Complex human instruction to be used for generation"
     )
@@ -852,6 +874,9 @@ class DiffusersConfig(BaseModel):
     )
     train_flow_shift: float = Field(
         default=3.0, description="flow shift used for training"
+    )
+    lora: LoraConfig | None = Field(
+        default=None, description="LoRA configuration for diffusers model"
     )
 
 

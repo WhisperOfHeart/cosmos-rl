@@ -81,6 +81,8 @@ wfm = [
     "webdataset",
     "decord",
     "trimesh",
+    "diffuers>=0.33.1",
+    "peft==0.10.0",
 ]
 vla = [
     "bddl==1.0.1",
