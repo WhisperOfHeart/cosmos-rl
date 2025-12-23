@@ -74,3 +74,6 @@ class NFTTrainer(DiffusersTrainer):
                 update_step_interval=self.config.train.ema_update_step_interval,
                 device=self.device,
             )
+
+    def step_training(self):
+        pass

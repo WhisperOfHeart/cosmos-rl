@@ -847,6 +847,35 @@ class LoraConfig(BaseModel):
         return self
 
 
+class SampleConfig(BaseModel):
+    num_steps: int = Field(
+        default=40, description="Number of sampler inference steps for training"
+    )
+    eval_num_steps: int = Field(
+        default=40, description="Number of sampler inference steps for evaluation"
+    )
+    guidance_scale: float = Field(
+        default=4.5, description="Classifier-free guidance weight"
+    )
+    train_batch_size: int = Field(
+        default=1, description="Batch size per GPU for sampling during training"
+    )
+    test_batch_size: int = Field(
+        default=1, description="Batch size per GPU for sampling during testing"
+    )
+    num_batches_per_epoch: int = Field(
+        default=2, description="Number of batches to sample per epoch"
+    )
+    global_std: bool = Field(
+        default=True, description="Whether to use all samples in a batch to compute std"
+    )
+    noise_level: float = Field(default=1.0, description="Noise level for sampling")
+    deterministic_sampling: bool = Field(
+        default=False, description="Whether to use deterministic sampling"
+    )
+    solver: str = Field(default="dpm2", description="Sampler solver to be used")
+
+
 class DiffusersConfig(BaseModel):
     dtype: str = Field(
         default="float16",
@@ -877,6 +906,12 @@ class DiffusersConfig(BaseModel):
     )
     lora: LoraConfig | None = Field(
         default=None, description="LoRA configuration for diffusers model"
+    )
+    sample: SampleConfig = Field(
+        default_factory=SampleConfig, description="Sampling configuration"
+    )
+    resolution: int = Field(
+        default=512, description="Resolution of the generated images"
     )
 
 

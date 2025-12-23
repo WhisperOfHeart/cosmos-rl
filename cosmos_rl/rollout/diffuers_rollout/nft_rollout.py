@@ -13,23 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from typing import List
 
+import torch
+
 from cosmos_rl.dispatcher.data.packer.base import BaseDataPacker
+from cosmos_rl.dispatcher.data.data_fetcher import DataFetcherBase
 from cosmos_rl.dispatcher.data.schema import RLPayload
 from cosmos_rl.rollout.schema import RolloutResult
-
-from cosmos_rl.policy.config import Config as CosmosConfig
-import torch
 from cosmos_rl.rollout.rollout_base import RolloutBase, RolloutRegistry
+from cosmos_rl.policy.config import Config as CosmosConfig
+from cosmos_rl.policy.model.diffusers import DiffuserModel
+from cosmos_rl.utils.diffusers.text_embedding import compute_text_embeddings
+from cosmos_rl.utils.diffusers.pipeline_with_logprob import pipeline_with_logprob
 from cosmos_rl.utils.parallelism import ParallelDims
-from cosmos_rl.utils.logging import logger
-from torch.distributed.fsdp import (
-    register_fsdp_forward_method,
-    FSDPModule,
-)
-from cosmos_rl.dispatcher.data.data_fetcher import DataFetcherBase
 
 
 @RolloutRegistry.register("diffusion_nft_rollout")
@@ -45,11 +42,22 @@ class DiffusionNFTRollout(RolloutBase):
         Initialize the RolloutBase class.
         """
         super().__init__(config, parallel_dims, device)
+        self.model_inited = False
+        self.diffusers_config = config.policy.diffusers_config
 
     def post_init_hook(self, **kwargs):
         self.rollout_config = self.config.rollout
         self.validation_config = self.config.validation
         self._model_param_map = None  # key: compatible name, value: param
+
+    def set_neg_prompt_embed(self):
+        self.neg_prompt_embed, self.neg_pooled_prompt_embed = compute_text_embeddings(
+            [""],
+            self.model.text_encoders,
+            self.model.tokenizers,
+            max_sequence_length=128,
+            device=self.device,
+        )
 
     def rollout_generation(
         self,
@@ -61,42 +69,71 @@ class DiffusionNFTRollout(RolloutBase):
         *args,
         **kwargs,
     ) -> List[RolloutResult]:
-        """Generate sequences"""
-        assert (
-            self.parallel_dims.world_size == self.parallel_dims.dp_shard
-        ), "HF Rollout only supports world size equal to dp_shard"
         response = []
-        if isinstance(self.model, FSDPModule):
-            register_fsdp_forward_method(self.model, "generate")
-        self.model.eval()
         for pl in payloads:
-            prompt = data_packer.rollout_collate_fn(
-                [data_packer.get_rollout_input(pl.prompt)]
-            )[0]
-            model_inputs = self.tokenizer(prompt, return_tensors="pt").to(
-                self.model.device
+            prompts, metadatas = data_packer.get_rollout_input(
+                pl, self.config.rollout.n_generation
             )
-            generated_ids = self.model.generate(
-                **model_inputs,
-                **(
-                    self.hf_generate_kwargs
-                    if not is_validation
-                    else self.hf_val_generate_kwargs
-                ),
-            ).to(self.model.device)
-            generated_ids = [
-                output_ids[len(model_inputs.input_ids) :]
-                for output_ids in generated_ids
-            ]
-            texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-            for text in texts:
-                logger.debug(f"[ExampleHFRollout] Generated: {text}")
+            prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
+                prompts,
+                self.model.text_encoders,
+                self.model.tokenizers,
+                max_sequence_length=128,
+                device=self.device,
+            )
+            prompt_ids = self.model.tokenizers[0](
+                prompts,
+                padding="max_length",
+                max_length=256,
+                truncation=True,
+                return_tensors="pt",
+            ).input_ids.to(self.device)
+
+            self.model.transformer.set_adapter("ref")
+            with torch.no_grad():
+                images, latents, _ = pipeline_with_logprob(
+                    self.model.pipeline,
+                    prompt_embeds=prompt_embeds,
+                    pooled_prompt_embeds=pooled_prompt_embeds,
+                    negative_prompt_embeds=self.neg_prompt_embed.repeat(
+                        self.config.rollout.n_generation, 1, 1
+                    ),
+                    negative_pooled_prompt_embeds=self.neg_pooled_prompt_embed.repeat(
+                        self.config.rollout.n_generation, 1, 1
+                    ),
+                    num_inference_steps=self.diffusers_config.sample.num_steps,
+                    guidance_scale=self.diffusers_config.sample.guidance_scale,
+                    output_type="pt",
+                    height=self.diffusers_config.resolution,
+                    width=self.diffusers_config.resolution,
+                    noise_level=self.diffusers_config.sample.noise_level,
+                    deterministic=self.diffusers_config.sample.deterministic_sampling,
+                    solver=self.diffusers_config.sample.solver,
+                    model_type="sd3",
+                )
+                latents = torch.stack(latents, dim=1)
+                timesteps = self.model.pipeline.scheduler.timesteps.repeat(
+                    len(prompts), 1
+                ).to(self.device)
+
             response.append(
                 RolloutResult(
                     prompt=pl.prompt,
-                    completions=texts,
+                    completions=images,
                     completion_logprobs=None,
                     completion_token_ids=None,
+                    extra_info={
+                        "prompt_ids": prompt_ids,
+                        "prompt_metadatas": metadatas,
+                        "prompt_embeds": prompt_embeds,
+                        "pooled_prompt_embeds": pooled_prompt_embeds,
+                        "timesteps": timesteps,
+                        "next_timesteps": torch.concatenate(
+                            [timesteps[:, 1:], torch.zeros_like(timesteps[:, :1])],
+                            dim=1,
+                        ),
+                        "latents_clean": latents[:, -1],
+                    },
                 )
             )
         return response
@@ -108,6 +145,9 @@ class DiffusionNFTRollout(RolloutBase):
         """Get the underlying model"""
         return self.model
 
-    def set_underlying_model(self, model: torch.nn.Module):
+    def set_underlying_model(self, model: DiffuserModel):
         """Set the underlying model"""
         self.model = model
+        if not self.model_inited:
+            self.model_inited = True
+            self.set_neg_prompt_embed()

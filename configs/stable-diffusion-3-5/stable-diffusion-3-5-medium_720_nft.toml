@@ -10,6 +10,7 @@ model_gradient_checkpointing = true
 dtype = "float32"
 use_pipeline = true
 is_video = false
+resolution = 512
 
 [policy.diffusers_config.lora]
 r = 32
@@ -25,6 +26,17 @@ target_modules = [
     "attn.to_q",
     "attn.to_v",
 ]
+
+[policy.diffusers_config.sample]
+num_steps = 10
+eval_num_steps = 40
+guidance_scale = 4.5
+noise_level = 0.7
+solver = "dpm2"
+deterministic_sampling = true
+
+[rollout]
+n_generation = 24
 
 [logging]
 logger = ['console', 'wandb']
@@ -51,6 +63,9 @@ type = "grpo"
 trainer_type = "diffusion_nft"
 dataset.name = "pickscore"
 dataset.split = "train"
+
+[train.train_policy.grpo]
+kl_beta = 0.0001
 
 [train.ckpt]
 enable_checkpoint = false

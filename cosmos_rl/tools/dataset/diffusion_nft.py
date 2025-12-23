@@ -18,52 +18,13 @@ import json
 import os
 import toml
 
-import torch
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset
 
+from cosmos_rl.dispatcher.data.schema import RLPayload
 from cosmos_rl.launcher.worker_entry import main as launch_worker
 from cosmos_rl.policy.config import Config as CosmosConfig
 from cosmos_rl.policy.config import DatasetConfig
-
-
-# https://github.com/NVlabs/DiffusionNFT/blob/24af5554898d85e93efa492f42b5e9cdf4156e9b/scripts/train_nft_sd3.py#L118
-class DistributedKRepeatSampler(Sampler):
-    def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.k = k
-        self.num_replicas = num_replicas
-        self.rank = rank
-        self.seed = seed
-
-        self.total_samples = self.num_replicas * self.batch_size
-        assert (
-            self.total_samples % self.k == 0
-        ), f"k can not div n*b, k{k}-num_replicas{num_replicas}-batch_size{batch_size}"
-        self.m = self.total_samples // self.k
-        self.epoch = 0
-
-    def __iter__(self):
-        while True:
-            g = torch.Generator()
-            g.manual_seed(self.seed + self.epoch)
-            indices = torch.randperm(len(self.dataset), generator=g)[: self.m].tolist()
-            repeated_indices = [idx for idx in indices for _ in range(self.k)]
-
-            shuffled_indices = torch.randperm(
-                len(repeated_indices), generator=g
-            ).tolist()
-            shuffled_samples = [repeated_indices[i] for i in shuffled_indices]
-
-            per_card_samples = []
-            for i in range(self.num_replicas):
-                start = i * self.batch_size
-                end = start + self.batch_size
-                per_card_samples.append(shuffled_samples[start:end])
-            yield per_card_samples[self.rank]
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
+from cosmos_rl.dispatcher.data.packer.base import DataPacker
 
 
 class TextPromptDataset(Dataset):
@@ -91,6 +52,16 @@ class GenevalPromptDataset(Dataset):
 
     def __getitem__(self, idx):
         return {"prompt": self.prompts[idx], "metadata": self.metadatas[idx]}
+
+
+class DiffusionNFTDataPacker(DataPacker):
+    def __init__(self):
+        super().__init__()
+
+    def get_rollout_input(self, payload: RLPayload, n_generation: int):
+        prompts = [payload.prompt["prompt"]] * n_generation
+        metadatas = [payload.prompt["metadata"]] * n_generation
+        return prompts, metadatas
 
 
 def get_dataset(dataset_config: DatasetConfig) -> Dataset:
@@ -122,14 +93,10 @@ if __name__ == "__main__":
     rollout_batch_size = (
         config.train.train_policy.dataloader_batch_size or config.rollout.batch_size
     )
-    batch_sampler = DistributedKRepeatSampler(
-        train_dataset,
-        batch_size=rollout_batch_size,
-        k=config.rollout.n_generation,
-    )
 
     launch_worker(
         dataset=train_dataset,
         val_dataset=val_dataset,
-        batch_sampler=batch_sampler,
+        data_packer=DiffusionNFTDataPacker(),
+        val_data_packer=DiffusionNFTDataPacker(),
     )
